@@ -240,47 +240,69 @@ class CVECPEAnalyzer:
             'most_common_products': Counter(products).most_common(10)
         }
     
-    def export_to_excel(self, output_file, min_occurrence=2):
+    def export_to_excel(self, output_file, min_occurrence=2, show_top_cpe=True):
         """
         Export analysis results to Excel
         
         Args:
             output_file (str): Output Excel file path
             min_occurrence (int): Minimum CVE occurrence for common CPEs
+            show_top_cpe (bool): Whether to highlight the top common CPE
         """
-        # Find common CPEs
-        common_cpes = self.find_common_cpes(min_occurrence)
-        
-        # Get analysis
-        analysis = self.analyze_cpe_patterns()
-        
-        with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
-            # Sheet 1: Common CPEs
+        try:
+            # Find common CPEs
+            common_cpes = self.find_common_cpes(min_occurrence)
+            
+            # Get the top common CPE
+            top_cpe_info = self.get_top_common_cpe(min_occurrence)
+            
+            # Get analysis
+            analysis = self.analyze_cpe_patterns()
+            
+            with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
+            # Sheet 1: TOP COMMON CPE (New sheet specifically for your use case)
+            if top_cpe_info:
+                top_cpe, top_cves, top_count = top_cpe_info
+                top_data = [{
+                    'Rank': 1,
+                    'CPE': top_cpe,
+                    'CVE_Count': top_count,
+                    'Percentage_of_Total_CVEs': f"{(top_count/len(self.cve_cpe_mapping)*100):.1f}%",
+                    'Related_CVEs': ', '.join(top_cves),
+                    'CPE_Parts': self._parse_cpe_parts(top_cpe)
+                }]
+                top_df = pd.DataFrame(top_data)
+                top_df.to_excel(writer, sheet_name='TOP_Common_CPE', index=False)
+            
+            # Sheet 2: All Common CPEs (ranked)
             common_data = []
-            for cpe, cves in common_cpes.items():
+            for rank, (cpe, cves) in enumerate(common_cpes.items(), 1):
                 common_data.append({
+                    'Rank': rank,
                     'CPE': cpe,
                     'CVE_Count': len(cves),
-                    'Related_CVEs': ', '.join(cves)
+                    'Percentage_of_Total_CVEs': f"{(len(cves)/len(self.cve_cpe_mapping)*100):.1f}%",
+                    'Related_CVEs': ', '.join(cves),
+                    'CPE_Parts': self._parse_cpe_parts(cpe)
                 })
             
             common_df = pd.DataFrame(common_data)
-            common_df = common_df.sort_values('CVE_Count', ascending=False)
-            common_df.to_excel(writer, sheet_name='Common_CPEs', index=False)
+            common_df.to_excel(writer, sheet_name='All_Common_CPEs', index=False)
             
-            # Sheet 2: All CVE-CPE mappings
+            # Sheet 3: All CVE-CPE mappings
             all_mappings = []
             for cve_id, cpes in self.cve_cpe_mapping.items():
                 for cpe in cpes:
                     all_mappings.append({
                         'CVE_ID': cve_id,
-                        'CPE': cpe
+                        'CPE': cpe,
+                        'Is_Top_Common_CPE': 'YES' if top_cpe_info and cpe == top_cpe_info[0] else 'NO'
                     })
             
             all_df = pd.DataFrame(all_mappings)
             all_df.to_excel(writer, sheet_name='All_CVE_CPE_Mappings', index=False)
             
-            # Sheet 3: Analysis Summary
+            # Sheet 4: Analysis Summary
             summary_data = [
                 ['Total CVEs Processed', len(self.cve_cpe_mapping)],
                 ['Total Unique CPEs', analysis['total_unique_cpes']],
@@ -288,29 +310,71 @@ class CVECPEAnalyzer:
                 ['Common CPEs (min ' + str(min_occurrence) + ' CVEs)', len(common_cpes)]
             ]
             
+            if top_cpe_info:
+                summary_data.extend([
+                    ['Top Common CPE', top_cpe_info[0]],
+                    ['Top CPE Appears in CVEs', top_cpe_info[2]],
+                    ['Top CPE Coverage %', f"{(top_cpe_info[2]/len(self.cve_cpe_mapping)*100):.1f}%"]
+                ])
+            
             summary_df = pd.DataFrame(summary_data, columns=['Metric', 'Value'])
             summary_df.to_excel(writer, sheet_name='Summary', index=False)
             
-            # Sheet 4: Top Vendors
-            vendor_data = [{'Vendor': vendor, 'Count': count} 
-                          for vendor, count in analysis['most_common_vendors']]
-            vendor_df = pd.DataFrame(vendor_data)
-            vendor_df.to_excel(writer, sheet_name='Top_Vendors', index=False)
-            
-            # Sheet 5: Top Products
-            product_data = [{'Product': product, 'Count': count} 
-                           for product, count in analysis['most_common_products']]
-            product_df = pd.DataFrame(product_data)
-            product_df.to_excel(writer, sheet_name='Top_Products', index=False)
+            # Sheet 5: Linux Kernel Specific Analysis (if applicable)
+            linux_cpes = [cpe for cpe in analysis['most_common_cpes'] 
+                         if 'linux' in cpe[0].lower() or 'kernel' in cpe[0].lower()]
+            if linux_cpes:
+                linux_data = [{'CPE': cpe, 'Count': count} for cpe, count in linux_cpes[:20]]
+                linux_df = pd.DataFrame(linux_data)
+                linux_df.to_excel(writer, sheet_name='Linux_Kernel_CPEs', index=False)
         
         print(f"Analysis exported to {output_file}")
         print(f"Found {len(common_cpes)} common CPEs appearing in {min_occurrence}+ CVEs")
+        
+        if top_cpe_info:
+            top_cpe, top_cves, top_count = top_cpe_info
+            print(f"\n🏆 TOP COMMON CPE:")
+            print(f"   CPE: {top_cpe}")
+            print(f"   Appears in: {top_count}/{len(self.cve_cpe_mapping)} CVEs ({(top_count/len(self.cve_cpe_mapping)*100):.1f}%)")
+            print(f"   CVEs: {', '.join(top_cves[:5])}{'...' if len(top_cves) > 5 else ''}")
+    
+    def _parse_cpe_parts(self, cpe):
+        """
+        Parse CPE into readable parts
+        
+        Args:
+            cpe (str): CPE string
+            
+        Returns:
+            str: Human readable CPE parts
+        """
+        parts = cpe.split(':')
+        if len(parts) < 5:
+            return cpe
+        
+        try:
+            cpe_version = parts[0] if len(parts) > 0 else ''
+            part = parts[1] if len(parts) > 1 else ''
+            vendor = parts[2] if len(parts) > 2 else ''
+            product = parts[3] if len(parts) > 3 else ''
+            version = parts[4] if len(parts) > 4 else ''
+            update = parts[5] if len(parts) > 5 else ''
+            
+            readable = f"Vendor: {vendor}, Product: {product}"
+            if version and version != '*':
+                readable += f", Version: {version}"
+            if update and update != '*':
+                readable += f", Update: {update}"
+                
+            return readable
+        except:
+            return cpe
 
 def main():
     # Configuration
     API_BASE_URL = "http://localhost:8000"  # Replace with your API base URL
-    INPUT_EXCEL = "cves.xlsx"  # Your input Excel file with CVE IDs
-    OUTPUT_EXCEL = "cve_cpe_analysis.xlsx"  # Output file
+    INPUT_EXCEL = "linux_kernel_cves.xlsx"  # Your input Excel file with Linux kernel CVE IDs
+    OUTPUT_EXCEL = "linux_kernel_cve_analysis.xlsx"  # Output file
     CVE_COLUMN = "cve_id"  # Column name containing CVE IDs
     MIN_OCCURRENCE = 2  # Minimum number of CVEs for a CPE to be considered "common"
     
@@ -324,18 +388,64 @@ def main():
         print("No CVEs found in Excel file. Please check the file and column name.")
         return
     
+    print(f"Analyzing {len(cve_list)} Linux kernel CVEs...")
+    
     # Fetch CPE data for all CVEs
     analyzer.fetch_all_cpe_data(cve_list, delay=0.5)  # 0.5 second delay between calls
+    
+    # Get the TOP common CPE
+    top_cpe_info = analyzer.get_top_common_cpe(MIN_OCCURRENCE, prefer_latest_version=True)
+    
+    if top_cpe_info:
+        top_cpe, top_cves, top_count = top_cpe_info
+        print(f"\n🎯 RESULT: Top Common CPE for Linux Kernel CVEs")
+        print(f"{'='*60}")
+        print(f"CPE: {top_cpe}")
+        print(f"Appears in: {top_count} out of {len(cve_list)} CVEs ({(top_count/len(cve_list)*100):.1f}%)")
+        print(f"Affected CVEs: {', '.join(top_cves)}")
+        print(f"{'='*60}")
+    else:
+        print(f"\n❌ No common CPE found (appearing in {MIN_OCCURRENCE}+ CVEs)")
+        print("Try reducing MIN_OCCURRENCE value")
     
     # Export results to Excel
     analyzer.export_to_excel(OUTPUT_EXCEL, MIN_OCCURRENCE)
     
-    # Print some quick stats
-    print("\n=== Quick Statistics ===")
+    # Print detailed statistics
+    print(f"\n📊 Detailed Statistics:")
     analysis = analyzer.analyze_cpe_patterns()
-    print(f"Total CVEs processed: {len(analyzer.cve_cpe_mapping)}")
-    print(f"Total unique CPEs found: {analysis['total_unique_cpes']}")
-    print(f"Most common CPE: {analysis['most_common_cpes'][0] if analysis['most_common_cpes'] else 'None'}")
+    print(f"   Total CVEs processed: {len(analyzer.cve_cpe_mapping)}")
+    print(f"   Total unique CPEs found: {analysis['total_unique_cpes']}")
+    print(f"   Average CPEs per CVE: {analysis['total_cpe_instances']/len(analyzer.cve_cpe_mapping):.1f}")
+    
+    # Show top 5 most common CPEs
+    common_cpes = analyzer.find_common_cpes(MIN_OCCURRENCE)
+    if common_cpes:
+        print(f"\n🔝 Top 5 Most Common CPEs:")
+        for i, (cpe, cves) in enumerate(list(common_cpes.items())[:5], 1):
+            print(f"   {i}. {cpe} (in {len(cves)} CVEs)")
+
+# Additional utility function for quick analysis
+def quick_analysis(api_url, excel_file, cve_column="cve_id"):
+    """
+    Quick function to get just the top common CPE without full analysis
+    """
+    analyzer = CVECPEAnalyzer(api_url)
+    cve_list = analyzer.load_cves_from_excel(excel_file, cve_column)
+    
+    if cve_list:
+        print(f"Quick analysis of {len(cve_list)} CVEs...")
+        analyzer.fetch_all_cpe_data(cve_list, delay=0.3)
+        
+        top_cpe_info = analyzer.get_top_common_cpe(min_occurrence=2)
+        if top_cpe_info:
+            top_cpe, top_cves, top_count = top_cpe_info
+            print(f"\n🎯 TOP COMMON CPE: {top_cpe}")
+            print(f"   Found in {top_count}/{len(cve_list)} CVEs")
+            return top_cpe
+        else:
+            print("No common CPE found")
+            return None
 
 if __name__ == "__main__":
     main()

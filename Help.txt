@@ -1,0 +1,341 @@
+import pandas as pd
+import requests
+import json
+from collections import defaultdict, Counter
+import time
+from urllib.parse import urljoin
+
+class CVECPEAnalyzer:
+    def __init__(self, api_base_url):
+        """
+        Initialize the analyzer with your API base URL
+        
+        Args:
+            api_base_url (str): Base URL of your API (e.g., "http://localhost:8000")
+        """
+        self.api_base_url = api_base_url.rstrip('/')
+        self.cve_cpe_mapping = {}
+        self.session = requests.Session()
+        
+    def get_cpes_for_cve(self, cve_id):
+        """
+        Fetch CPEs for a given CVE from your API
+        
+        Args:
+            cve_id (str): CVE identifier (e.g., "CVE-2021-3997")
+            
+        Returns:
+            list: List of CPE strings for the CVE
+        """
+        try:
+            # Construct API endpoint based on your screenshot
+            url = f"{self.api_base_url}/api/cpes/?cve_id={cve_id}"
+            
+            response = self.session.get(url, timeout=30)
+            response.raise_for_status()
+            
+            data = response.json()
+            
+            # Extract CPEs from the response
+            # Based on your screenshot, it looks like CPEs are in the "affected_CPEs" field
+            cpes = []
+            if "affected_CPEs" in data:
+                cpes = data["affected_CPEs"]
+            elif isinstance(data, list):
+                # If response is directly a list of CPEs
+                cpes = data
+            elif "cpes" in data:
+                cpes = data["cpes"]
+            
+            # Clean and normalize CPE strings
+            cleaned_cpes = []
+            for cpe in cpes:
+                if isinstance(cpe, str) and cpe.startswith('cpe:'):
+                    cleaned_cpes.append(cpe.strip())
+            
+            return cleaned_cpes
+            
+        except requests.exceptions.RequestException as e:
+            print(f"Error fetching CPEs for {cve_id}: {e}")
+            return []
+        except json.JSONDecodeError as e:
+            print(f"Error parsing JSON response for {cve_id}: {e}")
+            return []
+    
+    def load_cves_from_excel(self, excel_file, cve_column='cve_id'):
+        """
+        Load CVE IDs from Excel file
+        
+        Args:
+            excel_file (str): Path to Excel file
+            cve_column (str): Name of column containing CVE IDs
+            
+        Returns:
+            list: List of CVE IDs
+        """
+        try:
+            df = pd.read_excel(excel_file)
+            cves = df[cve_column].dropna().tolist()
+            print(f"Loaded {len(cves)} CVEs from Excel file")
+            return cves
+        except Exception as e:
+            print(f"Error loading Excel file: {e}")
+            return []
+    
+    def fetch_all_cpe_data(self, cve_list, delay=0.5):
+        """
+        Fetch CPE data for all CVEs with rate limiting
+        
+        Args:
+            cve_list (list): List of CVE IDs
+            delay (float): Delay between API calls in seconds
+        """
+        print(f"Fetching CPE data for {len(cve_list)} CVEs...")
+        
+        for i, cve_id in enumerate(cve_list):
+            print(f"Processing {i+1}/{len(cve_list)}: {cve_id}")
+            
+            cpes = self.get_cpes_for_cve(cve_id)
+            self.cve_cpe_mapping[cve_id] = cpes
+            
+            if delay > 0:
+                time.sleep(delay)
+        
+        print("Finished fetching CPE data")
+    
+    def find_common_cpes(self, min_occurrence=2):
+        """
+        Find CPEs that appear across multiple CVEs
+        
+        Args:
+            min_occurrence (int): Minimum number of CVEs a CPE must appear in
+            
+        Returns:
+            dict: CPE to list of CVEs mapping, sorted by occurrence count
+        """
+        cpe_to_cves = defaultdict(list)
+        
+        # Build mapping of CPE to CVEs
+        for cve_id, cpes in self.cve_cpe_mapping.items():
+            for cpe in cpes:
+                cpe_to_cves[cpe].append(cve_id)
+        
+        # Filter by minimum occurrence and sort by count (descending)
+        common_cpes = {
+            cpe: cves for cpe, cves in cpe_to_cves.items() 
+            if len(cves) >= min_occurrence
+        }
+        
+        # Sort by occurrence count (descending), then by CPE name for consistency
+        sorted_common_cpes = dict(
+            sorted(common_cpes.items(), 
+                   key=lambda x: (-len(x[1]), x[0]))
+        )
+        
+        return sorted_common_cpes
+    
+    def get_top_common_cpe(self, min_occurrence=2, prefer_latest_version=True):
+        """
+        Get the single most common CPE across CVEs
+        
+        Args:
+            min_occurrence (int): Minimum number of CVEs a CPE must appear in
+            prefer_latest_version (bool): If multiple CPEs have same count, prefer latest version
+            
+        Returns:
+            tuple: (cpe_string, list_of_cves, occurrence_count) or None if no common CPE found
+        """
+        common_cpes = self.find_common_cpes(min_occurrence)
+        
+        if not common_cpes:
+            return None
+            
+        # Get CPEs with maximum occurrence count
+        max_count = max(len(cves) for cves in common_cpes.values())
+        top_cpes = {cpe: cves for cpe, cves in common_cpes.items() 
+                   if len(cves) == max_count}
+        
+        if len(top_cpes) == 1:
+            # Only one CPE with max count
+            cpe, cves = next(iter(top_cpes.items()))
+            return (cpe, cves, len(cves))
+        
+        # Multiple CPEs with same max count - apply tie-breaking logic
+        if prefer_latest_version:
+            # Try to find the one with the highest version number
+            best_cpe = self._select_best_cpe_by_version(list(top_cpes.keys()))
+        else:
+            # Just take the first one alphabetically
+            best_cpe = sorted(top_cpes.keys())[0]
+        
+        return (best_cpe, top_cpes[best_cpe], len(top_cpes[best_cpe]))
+    
+    def _select_best_cpe_by_version(self, cpe_list):
+        """
+        Select the best CPE from a list, preferring latest versions
+        
+        Args:
+            cpe_list (list): List of CPE strings
+            
+        Returns:
+            str: Best CPE string
+        """
+        def extract_version_info(cpe):
+            """Extract version and other sorting criteria from CPE"""
+            parts = cpe.split(':')
+            if len(parts) < 6:
+                return (cpe, '', '')
+            
+            version = parts[5] if len(parts) > 5 else ''
+            update = parts[6] if len(parts) > 6 else ''
+            
+            # Convert version to tuple of integers for proper sorting
+            def version_to_tuple(v):
+                if not v or v == '*':
+                    return (0,)  # Wildcard versions go first
+                try:
+                    # Handle versions like "5.4.0", "2.6.32-431"
+                    clean_v = v.split('-')[0]  # Remove suffixes like "-431"
+                    return tuple(int(x) for x in clean_v.split('.') if x.isdigit())
+                except:
+                    return (0,)  # Fallback for unparseable versions
+            
+            return (cpe, version_to_tuple(version), version, update)
+        
+        # Sort by version (descending), then by CPE string
+        cpe_with_versions = [extract_version_info(cpe) for cpe in cpe_list]
+        cpe_with_versions.sort(key=lambda x: (-sum(x[1]), x[2], x[0]), reverse=False)
+        
+        return cpe_with_versions[-1][0]  # Return the CPE with highest version
+    
+    def analyze_cpe_patterns(self):
+        """
+        Analyze patterns in CPE data
+        
+        Returns:
+            dict: Analysis results
+        """
+        all_cpes = []
+        for cpes in self.cve_cpe_mapping.values():
+            all_cpes.extend(cpes)
+        
+        cpe_counter = Counter(all_cpes)
+        
+        # Extract vendors and products
+        vendors = []
+        products = []
+        
+        for cpe in all_cpes:
+            parts = cpe.split(':')
+            if len(parts) >= 4:
+                vendors.append(parts[3])  # Vendor is typically the 4th component
+            if len(parts) >= 5:
+                products.append(parts[4])  # Product is typically the 5th component
+        
+        return {
+            'total_unique_cpes': len(cpe_counter),
+            'total_cpe_instances': len(all_cpes),
+            'most_common_cpes': cpe_counter.most_common(10),
+            'most_common_vendors': Counter(vendors).most_common(10),
+            'most_common_products': Counter(products).most_common(10)
+        }
+    
+    def export_to_excel(self, output_file, min_occurrence=2):
+        """
+        Export analysis results to Excel
+        
+        Args:
+            output_file (str): Output Excel file path
+            min_occurrence (int): Minimum CVE occurrence for common CPEs
+        """
+        # Find common CPEs
+        common_cpes = self.find_common_cpes(min_occurrence)
+        
+        # Get analysis
+        analysis = self.analyze_cpe_patterns()
+        
+        with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
+            # Sheet 1: Common CPEs
+            common_data = []
+            for cpe, cves in common_cpes.items():
+                common_data.append({
+                    'CPE': cpe,
+                    'CVE_Count': len(cves),
+                    'Related_CVEs': ', '.join(cves)
+                })
+            
+            common_df = pd.DataFrame(common_data)
+            common_df = common_df.sort_values('CVE_Count', ascending=False)
+            common_df.to_excel(writer, sheet_name='Common_CPEs', index=False)
+            
+            # Sheet 2: All CVE-CPE mappings
+            all_mappings = []
+            for cve_id, cpes in self.cve_cpe_mapping.items():
+                for cpe in cpes:
+                    all_mappings.append({
+                        'CVE_ID': cve_id,
+                        'CPE': cpe
+                    })
+            
+            all_df = pd.DataFrame(all_mappings)
+            all_df.to_excel(writer, sheet_name='All_CVE_CPE_Mappings', index=False)
+            
+            # Sheet 3: Analysis Summary
+            summary_data = [
+                ['Total CVEs Processed', len(self.cve_cpe_mapping)],
+                ['Total Unique CPEs', analysis['total_unique_cpes']],
+                ['Total CPE Instances', analysis['total_cpe_instances']],
+                ['Common CPEs (min ' + str(min_occurrence) + ' CVEs)', len(common_cpes)]
+            ]
+            
+            summary_df = pd.DataFrame(summary_data, columns=['Metric', 'Value'])
+            summary_df.to_excel(writer, sheet_name='Summary', index=False)
+            
+            # Sheet 4: Top Vendors
+            vendor_data = [{'Vendor': vendor, 'Count': count} 
+                          for vendor, count in analysis['most_common_vendors']]
+            vendor_df = pd.DataFrame(vendor_data)
+            vendor_df.to_excel(writer, sheet_name='Top_Vendors', index=False)
+            
+            # Sheet 5: Top Products
+            product_data = [{'Product': product, 'Count': count} 
+                           for product, count in analysis['most_common_products']]
+            product_df = pd.DataFrame(product_data)
+            product_df.to_excel(writer, sheet_name='Top_Products', index=False)
+        
+        print(f"Analysis exported to {output_file}")
+        print(f"Found {len(common_cpes)} common CPEs appearing in {min_occurrence}+ CVEs")
+
+def main():
+    # Configuration
+    API_BASE_URL = "http://localhost:8000"  # Replace with your API base URL
+    INPUT_EXCEL = "cves.xlsx"  # Your input Excel file with CVE IDs
+    OUTPUT_EXCEL = "cve_cpe_analysis.xlsx"  # Output file
+    CVE_COLUMN = "cve_id"  # Column name containing CVE IDs
+    MIN_OCCURRENCE = 2  # Minimum number of CVEs for a CPE to be considered "common"
+    
+    # Initialize analyzer
+    analyzer = CVECPEAnalyzer(API_BASE_URL)
+    
+    # Load CVEs from Excel
+    cve_list = analyzer.load_cves_from_excel(INPUT_EXCEL, CVE_COLUMN)
+    
+    if not cve_list:
+        print("No CVEs found in Excel file. Please check the file and column name.")
+        return
+    
+    # Fetch CPE data for all CVEs
+    analyzer.fetch_all_cpe_data(cve_list, delay=0.5)  # 0.5 second delay between calls
+    
+    # Export results to Excel
+    analyzer.export_to_excel(OUTPUT_EXCEL, MIN_OCCURRENCE)
+    
+    # Print some quick stats
+    print("\n=== Quick Statistics ===")
+    analysis = analyzer.analyze_cpe_patterns()
+    print(f"Total CVEs processed: {len(analyzer.cve_cpe_mapping)}")
+    print(f"Total unique CPEs found: {analysis['total_unique_cpes']}")
+    print(f"Most common CPE: {analysis['most_common_cpes'][0] if analysis['most_common_cpes'] else 'None'}")
+
+if __name__ == "__main__":
+    main()
